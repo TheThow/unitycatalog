@@ -16,7 +16,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{NamespaceAlreadyExistsException, NoSuchNamespaceException, NoSuchTableException}
-import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType, CatalogUtils}
+import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable, CatalogTableType, CatalogUtils}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.connector.catalog._
 import org.apache.spark.sql.connector.expressions.Transform
@@ -40,7 +40,8 @@ import scala.language.existentials
 class UCSingleCatalog
   extends StagingTableCatalog
   with SupportsNamespaces
-  with Logging {
+  with Logging
+  with UCSingleCatalogViewShim {
 
   private[this] var uri: URI = null
   private[this] var tokenProvider: TokenProvider = null
@@ -61,6 +62,11 @@ class UCSingleCatalog
   private[this] var deltaCatalogLoaded: Boolean = false
 
   @volatile private var delegate: TableCatalog = null
+
+  // The DeltaCatalog delegate is not a ViewCatalog, so view operations go straight to the UC proxy.
+  // View DDL is only routed to a v2 ViewCatalog by Spark 4.2+, so the actual ViewCatalog methods
+  // live in the per-version shim trait; here we just hold the proxy that backs them.
+  protected[spark] var viewDelegate: UCProxy = null
 
   override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = {
     val urlStr = options.get(OptionsUtil.URI)
@@ -83,6 +89,7 @@ class UCSingleCatalog
     val proxy = new UCProxy(uri, tokenProvider, renewCredEnabled, credScopedFsEnabled,
       serverSidePlanningEnabled, apiClient, tablesApi)
     proxy.initialize(name, options)
+    viewDelegate = proxy
     if (UCSingleCatalog.LOAD_DELTA_CATALOG.get()) {
       try {
         delegate = Class.forName("org.apache.spark.sql.delta.catalog.DeltaCatalog")
@@ -610,9 +617,14 @@ private class UCProxy(
     credScopedFsEnabled: Boolean,
     serverSidePlanningEnabled: Boolean,
     apiClient: ApiClient,
-    tablesApi: TablesApi) extends TableCatalog with SupportsNamespaces with Logging {
+    tablesApi: TablesApi)
+    extends TableCatalog with SupportsNamespaces with Logging with UCProxyViewShim {
   private[this] var name: String = null
   private[this] var schemasApi: SchemasApi = null
+
+  // Accessors used by the per-version view shim trait (UCProxyViewShim).
+  protected[spark] def viewTablesApi: TablesApi = tablesApi
+  protected[spark] def buildViewColumns(schema: StructType): Seq[ColumnInfo] = buildColumns(schema, Nil)
 
   override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = {
     this.name = name
@@ -633,7 +645,9 @@ private class UCProxy(
     var pageToken: String = null
     do {
       val response = tablesApi.listTables(catalogName, schemaName, /* limit */ 0, pageToken)
-      tables ++= response.getTables.asScala.map(table => Identifier.of(namespace, table.getName))
+      tables ++= response.getTables.asScala
+        .filter(_.getTableType != TableType.VIEW)
+        .map(table => Identifier.of(namespace, table.getName))
       pageToken = response.getNextPageToken
     } while (pageToken != null && pageToken.nonEmpty)
     tables.toArray
@@ -648,6 +662,9 @@ private class UCProxy(
     } catch {
       case e: ApiException if e.getCode == 404 =>
         throw new NoSuchTableException(ident)
+    }
+    if (t.getTableType == TableType.VIEW) {
+      return loadView(t)
     }
     val identifier = TableIdentifier(t.getName, Some(t.getSchemaName), Some(t.getCatalogName))
     val partitionCols = scala.collection.mutable.ArrayBuffer.empty[(String, Int)]
@@ -719,9 +736,40 @@ private class UCProxy(
     // Spark separates table lookup and data source resolution. To support Spark native data
     // sources, here we return the `V1Table` which only contains the table metadata. Spark will
     // resolve the data source and create scan node later.
+    asV1Table(sparkTable)
+  }
+
+  // A UC view has no storage or data source format; it is resolved by Spark from its SQL text.
+  // Returning a VIEW `CatalogTable` (with `tracksPartitionsInCatalog = false`) routes Spark's
+  // relation resolution through `SessionCatalog.getRelation`, which parses `viewText` and rewrites
+  // the query against the view's dependencies.
+  private def loadView(t: TableInfo): Table = {
+    val identifier = TableIdentifier(t.getName, Some(t.getSchemaName), Some(t.getCatalogName))
+    val fields = t.getColumns.asScala.map { col =>
+      StructField(col.getName, DataType.fromDDL(col.getTypeText), col.getNullable)
+        .withComment(col.getComment)
+    }.toArray
+    // Default catalog and namespace used to resolve unqualified identifiers in the view text.
+    val viewNamespaceProps =
+      CatalogTable.catalogAndNamespaceToProps(this.name, Seq(t.getSchemaName))
+    val viewTable = CatalogTable(
+      identifier = identifier,
+      tableType = CatalogTableType.VIEW,
+      storage = CatalogStorageFormat.empty,
+      schema = StructType(fields),
+      viewText = Option(t.getViewDefinition),
+      comment = Option(t.getComment),
+      properties = t.getProperties.asScala.toMap ++ viewNamespaceProps,
+      createTime = t.getCreatedAt,
+      tracksPartitionsInCatalog = false
+    )
+    asV1Table(viewTable)
+  }
+
+  private def asV1Table(catalogTable: CatalogTable): Table = {
     Class.forName("org.apache.spark.sql.connector.catalog.V1Table")
       .getDeclaredConstructor(classOf[CatalogTable])
-      .newInstance(sparkTable)
+      .newInstance(catalogTable)
       .asInstanceOf[Table]
   }
 
@@ -764,7 +812,23 @@ private class UCProxy(
           throw new ApiException(s"Unsupported partition transform: $other")
       }
     }.toSeq
-    val columns: Seq[ColumnInfo] = schema.fields.toSeq.zipWithIndex.map { case (field, i) =>
+    val columns: Seq[ColumnInfo] = buildColumns(schema, partitionColNames)
+    val comment = Option(properties.get(TableCatalog.PROP_COMMENT))
+    comment.foreach(createTable.setComment(_))
+    createTable.setColumns(columns)
+    createTable.setDataSourceFormat(convertDatasourceFormat(format))
+    // Do not send the V2 table properties as they are made part of the `createTable` already.
+    val propertiesToServer =
+      properties.view.filterKeys(!UCTableProperties.V2_TABLE_PROPERTIES.contains(_)).toMap
+    createTable.setProperties(propertiesToServer)
+    tablesApi.createTable(createTable)
+    loadTable(ident)
+  }
+
+  private def buildColumns(
+      schema: StructType,
+      partitionColNames: Seq[String]): Seq[ColumnInfo] = {
+    schema.fields.toSeq.zipWithIndex.map { case (field, i) =>
       val column = new ColumnInfo()
       column.setName(field.name)
       if (field.getComment().isDefined) {
@@ -779,16 +843,6 @@ private class UCProxy(
       if (partitionIdx >= 0) column.setPartitionIndex(partitionIdx)
       column
     }
-    val comment = Option(properties.get(TableCatalog.PROP_COMMENT))
-    comment.foreach(createTable.setComment(_))
-    createTable.setColumns(columns)
-    createTable.setDataSourceFormat(convertDatasourceFormat(format))
-    // Do not send the V2 table properties as they are made part of the `createTable` already.
-    val propertiesToServer =
-      properties.view.filterKeys(!UCTableProperties.V2_TABLE_PROPERTIES.contains(_)).toMap
-    createTable.setProperties(propertiesToServer)
-    tablesApi.createTable(createTable)
-    loadTable(ident)
   }
 
   private def toStructFieldJson(field: StructField): String = {
